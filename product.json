@@ -1,0 +1,7 @@
+{
+  "id": "factory",
+  "name": "造物 · Product Foundry",
+  "port": 4320,
+  "devPort": 4321,
+  "repo": "product-foundry"
+}
