@@ -3,7 +3,7 @@ import express from "express";
 import multer from "multer";
 import JSZip from "jszip";
 import mammoth from "mammoth";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,6 +119,7 @@ app.use("/api", (req, res, next) => {
 });
 let apiKey = "";
 const controllers = new Map();
+const projectLocks = new Set();
 const settingsDefaults = {
   id: "settings",
   provider: "demo",
@@ -256,6 +257,13 @@ app.delete("/api/documents/:id", async (req, res) => {
 });
 async function createJob(body, projectId = null) {
   const input = requestSchema.parse(body);
+  const expectedVersionId = body.expectedVersionId === undefined ? undefined : z.string().min(1).max(100).parse(body.expectedVersionId);
+  const expectedHtmlSha256 = body.expectedHtmlSha256 === undefined ? undefined : z.string().regex(/^[a-f0-9]{64}$/).parse(body.expectedHtmlSha256);
+  if (projectId && projectLocks.has(projectId)) throw Object.assign(new Error("此原型项目已有任务在执行，请完成后再修改。"), { status: 409 });
+  if (controllers.size >= 2) throw new Error("当前有两个任务在执行，请等待完成后再提交。");
+  const jobId = randomUUID(); const controller = new AbortController(); controllers.set(jobId, controller);
+  if (projectId) projectLocks.add(projectId);
+  try {
   const docs = await Promise.all(
     input.documentIds.map((id) => store.get(id, "document")),
   );
@@ -263,15 +271,13 @@ async function createJob(body, projectId = null) {
     throw new Error("所选资料已删除，请重新选择。");
   if (docs.reduce((n, d) => n + d.text.length, 0) > 65000)
     throw new Error("所选资料总量超过 65,000 字符，请分批处理。");
-  if (controllers.size >= 2)
-    throw new Error("当前有两个任务在执行，请等待完成后再提交。");
   const config = await settings();
   const provider = input.provider || config.provider;
   if (cloud && provider === "codex")
     throw new Error("线上版本无法调用本机 Codex，请选择 API 模型。");
   const job = {
     ...input,
-    id: randomUUID(),
+    id: jobId,
     mode,
     provider,
     projectId,
@@ -280,10 +286,10 @@ async function createJob(body, projectId = null) {
     events: [],
     result: null,
     error: null,
+    ...(expectedVersionId ? { expectedVersionId } : {}),
+    ...(expectedHtmlSha256 ? { expectedHtmlSha256 } : {}),
   };
   await store.put("job", job);
-  const controller = new AbortController();
-  controllers.set(job.id, controller);
   const execute = async () => {
     try {
       if (controller.signal.aborted) return;
@@ -291,10 +297,14 @@ async function createJob(body, projectId = null) {
       await event(job, "任务已创建，正在整理输入");
       await event(
         job,
-        `已载入 ${docs.length} 份资料；${provider === "demo" ? "使用演示模板，未调用 AI" : provider === "codex" ? "正在调用本机 Codex" : "正在请求模型接口"}`,
+        `已载入 ${docs.length} 份资料；${provider === "demo" ? "使用演示模板，未调用 AI" : "正在校验最终模型输入预算"}`,
       );
       const previous = projectId ? await store.get(projectId, "project") : null;
       if (projectId && !previous?.versions) throw new Error("项目不存在。");
+      if (expectedVersionId && previous?.versions.at(-1)?.id !== expectedVersionId) throw Object.assign(new Error("旧原型版本已变化，请重新预览绑定版本后再提交。"), { code: "PROTOTYPE_VERSION_CHANGED", modelInvocation: "not-invoked" });
+      if (expectedHtmlSha256 && createHash("sha256").update(previous?.versions.at(-1)?.code || "").digest("hex") !== expectedHtmlSha256) throw Object.assign(new Error("旧原型 HTML 已变化，请重新核对生成目标。"), { code: "PROTOTYPE_VERSION_CHANGED", modelInvocation: "not-invoked" });
+      const finalPrompt = provider === "demo" ? null : buildPrompt(mode, job, docs, previous?.versions.at(-1));
+      if (finalPrompt) job.inputBudget = { actualChars: finalPrompt.length, maxChars: Number(process.env.FOUNDRY_MODEL_PROMPT_MAX_CHARS || 120000), unit: "utf16-code-units", scope: "foundry-built-prompt-excludes-provider-envelope", decision: "within-budget", modelInvocation: "adapter-call-not-yet-confirmed" };
       const result =
         provider === "demo"
           ? mode === "worker"
@@ -302,7 +312,7 @@ async function createJob(body, projectId = null) {
             : demoFactory(job)
           : await runModel(
               provider,
-              buildPrompt(mode, job, docs, previous?.versions.at(-1)),
+              finalPrompt,
               mode === "worker" ? workerSchema : fragmentSchema,
               config,
               controller.signal,
@@ -326,13 +336,15 @@ async function createJob(body, projectId = null) {
           createdAt: job.createdAt,
           versions: [],
         };
-        project.versions.push({
+        const version = {
           ...result,
           id: randomUUID(),
           createdAt: new Date().toISOString(),
           prompt: job.prompt,
           provider,
-        });
+        };
+        project.versions.push(version);
+        job.versionId = version.id;
         project.updatedAt = new Date().toISOString();
         project.title = result.title;
         project.description = result.description;
@@ -343,6 +355,11 @@ async function createJob(body, projectId = null) {
       job.completedAt = new Date().toISOString();
       await event(job, "交付物已校验并保存");
     } catch (e) {
+      if (e.modelInvocation === "not-invoked") {
+        job.errorCode = e.code; job.inputValidation = { code: e.code, modelInvocation: "not-invoked", reason: e.message };
+        if (e.code === "MODEL_PROMPT_TOO_LARGE") job.inputBudget = { actualChars: e.actualChars, maxChars: e.maxChars, unit: e.unit, previousHtmlChars: e.previousHtmlChars, scope: "foundry-built-prompt-excludes-provider-envelope", modelInvocation: "not-invoked" };
+        job.usage = { inputTokens: null, outputTokens: null, cachedTokens: null, cost: null, currency: null, requestCount: 0, note: "输入预检在模型调用前拒绝了任务；没有模型 Token 或现金账单记录。" };
+      }
       if (e.raw) { job.modelTrace = e.raw; job.usage = e.usage || e.raw.usage; }
       if (!controller.signal.aborted) {
         job.status = "failed";
@@ -358,11 +375,13 @@ async function createJob(body, projectId = null) {
       }
     } finally {
       controllers.delete(job.id);
+      if (projectId) projectLocks.delete(projectId);
     }
   };
   const execution = execute();
   if (cloud) waitUntil(execution);
   return job;
+  } catch (error) { controllers.delete(jobId); if (projectId) projectLocks.delete(projectId); throw error; }
 }
 app.post("/api/jobs", async (req, res) =>
   res.status(202).json(await createJob(req.body)),
@@ -472,7 +491,7 @@ app.use((error, req, res, next) => {
       : error.code === "LIMIT_FILE_SIZE"
         ? "文件不能超过 8 MB。"
         : error.message || "请求失败。";
-  res.status(400).json({ error: message });
+  res.status(error.status || 400).json({ error: message, ...(error.code ? { code: error.code } : {}) });
 });
 export default app;
 if (!cloud) {

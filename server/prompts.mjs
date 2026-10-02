@@ -8,11 +8,11 @@ Do not browse, read files, execute commands, or use any tools. Produce the reque
 Never invent evidence, measurements, market statistics, interview quotes, URLs or completed actions.
 Clearly distinguish source-backed facts, inference, assumptions, and open questions.
 Write in natural professional Chinese. Deliver usable content, not a description of work you would do.`;
-export function buildPrompt(mode, job, documents, previous) {
+export const DEFAULT_MODEL_PROMPT_MAX_CHARS = 120000;
+export function buildPrompt(mode, job, documents, previous, { maxChars = Number(process.env.FOUNDRY_MODEL_PROMPT_MAX_CHARS || DEFAULT_MODEL_PROMPT_MAX_CHARS) } = {}) {
   const context = documents
     .map((d, i) => `[来源 ${i + 1}: ${d.name}]\n${d.text}`)
-    .join("\n\n")
-    .slice(0, 65000);
+    .join("\n\n");
   const output =
     mode === "worker"
       ? `You are an AI product manager's office worker. Your specialty is ${job.kind}.
@@ -23,6 +23,9 @@ Cite supplied sources by [来源 N] and never claim live web research. If none s
 Return JSON with title, description, commentary, code, prd. code is a COMPLETE runnable single HTML document, including CSS and vanilla JavaScript. Use no external dependencies, CDN, external images, network calls, eval, inline frames, or backticks wrapping the result.
 Build an attractive polished Chinese UI responsive to mobile, with genuinely working input forms, add/edit/delete or other relevant actions, search/filter, state updates, empty states, and export when relevant. Use localStorage with try/catch fallback to in-memory state (sandbox preview cannot access storage). No placeholder buttons. Demonstration data must be labelled 示例数据. Never fabricate a working AI API: label simulated AI behavior and provide integration notes in the PRD. Color palette indigo, ivory, graphite. Add accessible labels. Use CSS typography, not emoji decorations.
 The prd must explain the user's problem, scope, implemented flows, data structure, acceptance criteria and limitations, including which actions use local data. The artifact is a browser prototype, not a deployed full-stack system.
-${previous ? "Implement this revision on the existing application, retaining working features. Existing HTML:\n" + previous.code.slice(0, 90000) : ""}`;
-  return `${BASE_SYSTEM_PROMPT}\n\n${output}\n\n任务标题：${job.title}\n任务需求：${job.prompt}\n\n${context ? "用户提供的资料：\n" + context : "用户未提供外部资料。"}\n\nReturn ONLY the JSON object, no markdown fences.`;
+${previous ? "Implement this revision on the existing application, retaining working features. Existing HTML:\n" + previous.code : ""}`;
+  const prompt = `${BASE_SYSTEM_PROMPT}\n\n${output}\n\n任务标题：${job.title}\n任务需求：${job.prompt}\n\n${context ? "用户提供的资料：\n" + context : "用户未提供外部资料。"}\n\nReturn ONLY the JSON object, no markdown fences.`;
+  if (!Number.isInteger(maxChars) || maxChars < 1000) throw new Error("模型输入预算配置无效。");
+  if (prompt.length > maxChars) throw Object.assign(new Error("最终模型输入超过字符预算；请减少资料，或新建原型而非续写过大的旧 HTML。"), { status: 413, code: "MODEL_PROMPT_TOO_LARGE", actualChars: prompt.length, maxChars, unit: "utf16-code-units", previousHtmlChars: previous?.code?.length || 0, modelInvocation: "not-invoked" });
+  return prompt;
 }
