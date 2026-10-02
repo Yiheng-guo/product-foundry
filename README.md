@@ -4,7 +4,7 @@
 
 [打开线上工作空间](https://product-foundry-psi.vercel.app) · [开源调研与二开说明](docs/OPEN_SOURCE_RESEARCH.md)
 
-> 这是独立项目，拥有自己的运行服务、数据库和 Vercel 部署。办公 Worker 在独立仓库 [AI PM Worker](https://github.com/Yiheng-guo/ai-pm-worker)，本项目不依赖它。
+> 这是独立项目，拥有自己的运行服务、数据库和 Vercel 部署，可以单独使用。与 [亦伴 Personal Agent](https://github.com/Yiheng-guo/ai-pm-worker) 组合时，亦伴负责项目记忆、研究、证据与需求，本项目提供原型生成、版本和源码导出。[查看完整组合演示](https://github.com/Yiheng-guo/ai-pm-worker/blob/main/docs/demo/README.md)。
 
 ## 从想法到交付
 
@@ -18,6 +18,8 @@
 **交付范围是浏览器前端原型**。没有声称自动完成业务后端、用户系统、支付或多人协作。预览中的业务数据不持久化；导出后的应用可使用浏览器本地存储。生成代码不会在服务器运行，不会自动安装模型建议的依赖。
 
 本机 Personal Agent 集成版本会保存生成依据并明确选择原型范围。造物在调用模型前检查完整构造的提示（包括资料、规则与已有 HTML），超限拒绝而不静默裁剪；默认上限 120,000 UTF16 单位，可通过 `FOUNDRY_MODEL_PROMPT_MAX_CHARS` 调整。这是字符预算，不是模型 Token 或账单。预算通过也不能据此宣称模型实际启动，执行状态与用量来自调用记录。
+
+当前 `main` 包含与亦伴连接所需的生成回执、实际用量、取消收尾和精确版本绑定。完整组合启动方式见[亦伴本机说明](https://github.com/Yiheng-guo/ai-pm-worker#本机启动)。公开静态原型使用示例数据；它不会调用造物服务或模型。
 
 ## 本机运行
 
