@@ -3,20 +3,17 @@ import express from "express";
 import multer from "multer";
 import JSZip from "jszip";
 import mammoth from "mammoth";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { createStore } from "./store.mjs";
-import { requestSchema, workerSchema, fragmentSchema } from "./schemas.mjs";
-import { buildPrompt } from "./prompts.mjs";
-import { runModel, modelTrace } from "./provider.mjs";
+import { requestSchema } from "./schemas.mjs";
+import { executeFoundryJob } from "./job-execution.mjs";
 import {
   workerTemplates,
   factoryTemplates,
-  demoWorker,
-  demoFactory,
 } from "./templates.mjs";
 import { waitUntil } from "@vercel/functions";
 import {
@@ -120,6 +117,9 @@ app.use("/api", (req, res, next) => {
 let apiKey = "";
 const controllers = new Map();
 const projectLocks = new Set();
+const activeJobs = new Map();
+const finalizing = new Set();
+const eventWrites = new Map();
 const settingsDefaults = {
   id: "settings",
   provider: "demo",
@@ -143,7 +143,9 @@ async function safeSettings() {
 }
 async function event(job, message) {
   job.events.push({ at: new Date().toISOString(), message });
-  await store.put("job", job);
+  const write = (eventWrites.get(job.id) || Promise.resolve()).catch(() => {}).then(() => store.put("job", job));
+  eventWrites.set(job.id, write);
+  await write;
 }
 if (!cloud)
   for (const job of await store.list("job"))
@@ -289,112 +291,35 @@ async function createJob(body, projectId = null) {
     ...(expectedVersionId ? { expectedVersionId } : {}),
     ...(expectedHtmlSha256 ? { expectedHtmlSha256 } : {}),
   };
+  activeJobs.set(job.id, job);
   await store.put("job", job);
   const execute = async () => {
     try {
-      if (controller.signal.aborted) return;
-      job.status = "running";
-      await event(job, "任务已创建，正在整理输入");
-      await event(
-        job,
-        `已载入 ${docs.length} 份资料；${provider === "demo" ? "使用演示模板，未调用 AI" : "正在校验最终模型输入预算"}`,
-      );
-      const previous = projectId ? await store.get(projectId, "project") : null;
-      if (projectId && !previous?.versions) throw new Error("项目不存在。");
-      if (expectedVersionId && previous?.versions.at(-1)?.id !== expectedVersionId) throw Object.assign(new Error("旧原型版本已变化，请重新预览绑定版本后再提交。"), { code: "PROTOTYPE_VERSION_CHANGED", modelInvocation: "not-invoked" });
-      if (expectedHtmlSha256 && createHash("sha256").update(previous?.versions.at(-1)?.code || "").digest("hex") !== expectedHtmlSha256) throw Object.assign(new Error("旧原型 HTML 已变化，请重新核对生成目标。"), { code: "PROTOTYPE_VERSION_CHANGED", modelInvocation: "not-invoked" });
-      const finalPrompt = provider === "demo" ? null : buildPrompt(mode, job, docs, previous?.versions.at(-1));
-      if (finalPrompt) job.inputBudget = { actualChars: finalPrompt.length, maxChars: Number(process.env.FOUNDRY_MODEL_PROMPT_MAX_CHARS || 120000), unit: "utf16-code-units", scope: "foundry-built-prompt-excludes-provider-envelope", decision: "within-budget", modelInvocation: "adapter-call-not-yet-confirmed" };
-      const result =
-        provider === "demo"
-          ? mode === "worker"
-            ? demoWorker(job, docs)
-            : demoFactory(job)
-          : await runModel(
-              provider,
-              finalPrompt,
-              mode === "worker" ? workerSchema : fragmentSchema,
-              config,
-              controller.signal,
-            );
-      if (
-        controller.signal.aborted ||
-        (await store.get(job.id, "job"))?.status === "cancelled"
-      )
-        return;
-      if (mode === "factory" && !/<html[\s>]/i.test(result.code))
-        throw new Error("模型没有返回完整 HTML 应用，请重试。");
-      job.result = result;
-      const trace = modelTrace(result);
-      if (trace) { job.usage = trace.usage; job.modelTrace = trace; }
-      if (mode === "factory") {
-        const project = previous || {
-          id: randomUUID(),
-          title: result.title,
-          description: result.description,
-          kind: job.kind,
-          createdAt: job.createdAt,
-          versions: [],
-        };
-        const version = {
-          ...result,
-          id: randomUUID(),
-          createdAt: new Date().toISOString(),
-          prompt: job.prompt,
-          provider,
-        };
-        project.versions.push(version);
-        job.versionId = version.id;
-        project.updatedAt = new Date().toISOString();
-        project.title = result.title;
-        project.description = result.description;
-        await store.put("project", project);
-        job.projectId = project.id;
-      }
-      job.status = "completed";
-      job.completedAt = new Date().toISOString();
-      await event(job, "交付物已校验并保存");
-    } catch (e) {
-      if (e.modelInvocation === "not-invoked") {
-        job.errorCode = e.code; job.inputValidation = { code: e.code, modelInvocation: "not-invoked", reason: e.message };
-        if (e.code === "MODEL_PROMPT_TOO_LARGE") job.inputBudget = { actualChars: e.actualChars, maxChars: e.maxChars, unit: e.unit, previousHtmlChars: e.previousHtmlChars, scope: "foundry-built-prompt-excludes-provider-envelope", modelInvocation: "not-invoked" };
-        job.usage = { inputTokens: null, outputTokens: null, cachedTokens: null, cost: null, currency: null, requestCount: 0, note: "输入预检在模型调用前拒绝了任务；没有模型 Token 或现金账单记录。" };
-      }
-      if (e.raw) { job.modelTrace = e.raw; job.usage = e.usage || e.raw.usage; }
-      if (!controller.signal.aborted) {
-        job.status = "failed";
-        job.error =
-          e instanceof z.ZodError
-            ? "模型返回格式不符合要求，请重试。"
-            : e.message;
-        job.completedAt = new Date().toISOString();
-        await event(job, "任务未完成，已保留输入与可用模型记录");
-      } else if (e.raw) {
-        const saved = await store.get(job.id, "job");
-        if (saved) await store.put("job", { ...saved, usage: job.usage, modelTrace: job.modelTrace });
-      }
+      await executeFoundryJob({ job, controller, store, event, mode, docs, config, beginFinalizing: id => finalizing.add(id), flushEvents: id => eventWrites.get(id)?.catch(() => {}) });
     } finally {
-      controllers.delete(job.id);
+      controllers.delete(job.id); activeJobs.delete(job.id); finalizing.delete(job.id); eventWrites.delete(job.id);
       if (projectId) projectLocks.delete(projectId);
     }
   };
   const execution = execute();
   if (cloud) waitUntil(execution);
   return job;
-  } catch (error) { controllers.delete(jobId); if (projectId) projectLocks.delete(projectId); throw error; }
+  } catch (error) { controllers.delete(jobId); activeJobs.delete(jobId); if (projectId) projectLocks.delete(projectId); throw error; }
 }
 app.post("/api/jobs", async (req, res) =>
   res.status(202).json(await createJob(req.body)),
 );
 app.post("/api/jobs/:id/cancel", async (req, res) => {
-  const job = await store.get(req.params.id, "job");
-  if (!job?.status) return res.status(404).json({ error: "任务不存在。" });
-  if (!["queued", "running"].includes(job.status))
-    return res.status(409).json({ error: "任务已结束。" });
+  const saved = await store.get(req.params.id, "job");
+  if (!saved?.status) return res.status(404).json({ error: "任务不存在。" });
+  const job = activeJobs.get(saved.id) || saved;
+  if (finalizing.has(job.id)) return res.status(409).json({ error: "任务正在保存最终版本，已进入不可取消的提交阶段。", code: "RUN_FINALIZING" });
+  if (!["queued", "running"].includes(job.status)) return res.json(job);
+  if (job.cancellationPending) return res.status(202).json(job);
+  job.cancelRequestedAt = new Date().toISOString(); job.cancellationPending = true;
   controllers.get(job.id)?.abort();
-  job.status = "cancelled";
-  await event(job, "任务已取消");
-  res.json(job);
+  await event(job, "正在取消并保存已收到的模型记录");
+  res.status(202).json(job);
 });
 app.post("/api/jobs/:id/retry", async (req, res) => {
   const job = await store.get(req.params.id, "job");
